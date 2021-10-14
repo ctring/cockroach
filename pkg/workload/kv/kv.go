@@ -24,7 +24,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
@@ -81,6 +84,9 @@ type kv struct {
 	shards                               int
 	targetCompressionRatio               float64
 	enum                                 bool
+	insertCount                          int
+	regions                              string
+	singleReplica                        bool
 }
 
 func init() {
@@ -143,6 +149,9 @@ var kvMeta = workload.Meta{
 			`Target compression ratio for data blocks. Must be >= 1.0`)
 		g.flags.BoolVar(&g.enum, `enum`, false,
 			`Inject an enum column and use it`)
+		g.flags.IntVar(&g.insertCount, `insert-count`, 1000, `Number of initial rows`)
+		g.flags.StringVar(&g.regions, `regions`, "", `Regions in multi-region deployment`)
+		g.flags.BoolVar(&g.singleReplica, `single-replica`, false, `Only have a single replica per region`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -157,6 +166,58 @@ func (w *kv) Flags() workload.Flags { return w.flags }
 // Hooks implements the Hookser interface.
 func (w *kv) Hooks() workload.Hooks {
 	return workload.Hooks{
+		PreLoad: func(db *gosql.DB) error {
+			var err error
+			w.regions = strings.TrimSpace(w.regions)
+			if w.regions != "" {
+				regions := strings.Split(w.regions, ",")
+
+				for r, region := range regions {
+					var err error
+					if r == 0 {
+						_, err = db.Exec(fmt.Sprintf(`ALTER DATABASE kv PRIMARY REGION "%s"`, region))
+					} else {
+						_, err = db.Exec(fmt.Sprintf(`ALTER DATABASE kv ADD REGION "%s"`, region))
+					}
+					if err != nil {
+						return err
+					}
+				}
+
+				var cases strings.Builder
+				for r, region := range regions {
+					cases.WriteString(fmt.Sprintf(` WHEN mod(k, %d) = %d THEN '%s'`, len(regions), r, region))
+				}
+				regionCol := fmt.Sprintf(`ALTER TABLE kv ADD COLUMN region crdb_internal_region AS (CASE %s END) STORED`, cases.String())
+				_, err = db.Exec(regionCol)
+				if err != nil {
+					return err
+				}
+
+				_, err = db.Exec(`
+				ALTER TABLE kv ALTER COLUMN region SET NOT NULL;
+				ALTER TABLE kv SET LOCALITY REGIONAL BY ROW AS "region";`)
+
+				if w.singleReplica {
+					_, err = db.Exec(`
+					SET override_multi_region_zone_config=true;
+					ALTER DATABASE kv CONFIGURE ZONE USING constraints='{}';
+					ALTER DATABASE kv CONFIGURE ZONE USING num_voters=1;
+					ALTER DATABASE kv CONFIGURE ZONE USING num_replicas=1;`)
+					if err != nil {
+						return err
+					}
+
+					for _, region := range regions {
+						_, err = db.Exec(fmt.Sprintf(`ALTER PARTITION "%s" OF INDEX kv.public.kv@primary CONFIGURE ZONE USING num_voters=1`, region))
+						if err != nil {
+							return err
+						}
+					}
+				}
+			}
+			return err
+		},
 		PostLoad: func(db *gosql.DB) error {
 			if !w.enum {
 				return nil
@@ -187,6 +248,8 @@ ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
 		},
 	}
 }
+
+var tableTypes = []*types.T{types.Int, types.Bytes}
 
 // Tables implements the Generator interface.
 func (w *kv) Tables() []workload.Table {
@@ -224,6 +287,30 @@ func (w *kv) Tables() []workload.Table {
 			table.Schema = kvSchema
 		}
 	}
+
+	const batchSize = 1000
+	table.InitialRows = workload.BatchedTuples{
+		NumBatches: (w.insertCount + batchSize - 1) / batchSize,
+		FillBatch: func(batchIdx int, cb coldata.Batch, _ *bufalloc.ByteAllocator) {
+			rowBegin, rowEnd := batchIdx*batchSize, (batchIdx+1)*batchSize
+			if rowEnd > w.insertCount {
+				rowEnd = w.insertCount
+			}
+			cb.Reset(tableTypes, rowEnd-rowBegin, coldata.StandardColumnFactory)
+
+			key := cb.ColVec(0).Int64()
+			value := cb.ColVec(1).Bytes()
+			value.Reset()
+
+			rng := rand.New(rand.NewSource(w.seed + int64(batchIdx)))
+			for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
+				rowOffset := rowIdx - rowBegin
+				key[rowOffset] = int64(rowIdx)
+				value.Set(rowOffset, randomBlock(w, rng))
+			}
+		},
+	}
+
 	return []workload.Table{table}
 }
 
