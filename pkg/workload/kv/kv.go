@@ -85,8 +85,12 @@ type kv struct {
 	targetCompressionRatio               float64
 	enum                                 bool
 	insertCount                          int
-	regions                              string
+	regionsStr                           string
+	regions                              []string
 	singleReplica                        bool
+	regionIdx                            int
+	localRegionPercent                   int
+	theta                                float64
 }
 
 func init() {
@@ -150,8 +154,11 @@ var kvMeta = workload.Meta{
 		g.flags.BoolVar(&g.enum, `enum`, false,
 			`Inject an enum column and use it`)
 		g.flags.IntVar(&g.insertCount, `insert-count`, 1000, `Number of initial rows`)
-		g.flags.StringVar(&g.regions, `regions`, "", `Regions in multi-region deployment`)
+		g.flags.StringVar(&g.regionsStr, `regions`, "", `Regions in multi-region deployment`)
 		g.flags.BoolVar(&g.singleReplica, `single-replica`, false, `Only have a single replica per region`)
+		g.flags.IntVar(&g.regionIdx, `region-idx`, 0, `Region of this client`)
+		g.flags.IntVar(&g.localRegionPercent, `local-region-percent`, 100, `Percent of transactions that only access local data`)
+		g.flags.Float64Var(&g.theta, `theta`, 0.5, `Theta parameter of the Zipfian distribution in multi-region setup`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -168,11 +175,9 @@ func (w *kv) Hooks() workload.Hooks {
 	return workload.Hooks{
 		PreLoad: func(db *gosql.DB) error {
 			var err error
-			w.regions = strings.TrimSpace(w.regions)
-			if w.regions != "" {
-				regions := strings.Split(w.regions, ",")
+			if len(w.regions) > 0 {
 
-				for r, region := range regions {
+				for r, region := range w.regions {
 					var err error
 					if r == 0 {
 						_, err = db.Exec(fmt.Sprintf(`ALTER DATABASE kv PRIMARY REGION "%s"`, region))
@@ -185,8 +190,8 @@ func (w *kv) Hooks() workload.Hooks {
 				}
 
 				var cases strings.Builder
-				for r, region := range regions {
-					cases.WriteString(fmt.Sprintf(` WHEN mod(k, %d) = %d THEN '%s'`, len(regions), r, region))
+				for r, region := range w.regions {
+					cases.WriteString(fmt.Sprintf(` WHEN mod(k, %d) = %d THEN '%s'`, len(w.regions), r, region))
 				}
 				regionCol := fmt.Sprintf(`ALTER TABLE kv ADD COLUMN region crdb_internal_region AS (CASE %s END) STORED`, cases.String())
 				_, err = db.Exec(regionCol)
@@ -208,7 +213,7 @@ func (w *kv) Hooks() workload.Hooks {
 						return err
 					}
 
-					for _, region := range regions {
+					for _, region := range w.regions {
 						_, err = db.Exec(fmt.Sprintf(`ALTER PARTITION "%s" OF INDEX kv.public.kv@primary CONFIGURE ZONE USING num_voters=1`, region))
 						if err != nil {
 							return err
@@ -243,6 +248,11 @@ ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
 			}
 			if w.targetCompressionRatio < 1.0 || math.IsNaN(w.targetCompressionRatio) {
 				return errors.New("'target-compression-ratio' must be a number >= 1.0")
+			}
+
+			regionsStr := strings.TrimSpace(w.regionsStr)
+			if regionsStr != "" {
+				w.regions = strings.Split(regionsStr, ",")
 			}
 			return nil
 		},
@@ -451,6 +461,13 @@ func (w *kv) Ops(
 		} else {
 			op.g = newHashGenerator(seq)
 		}
+		op.mg = nil
+		if len(w.regions) > 1 {
+			op.mg, err = newMultiRegionKeyGenerator(w, w.theta)
+			if err != nil {
+				return workload.QueryLoad{}, err
+			}
+		}
 		ql.WorkerFns = append(ql.WorkerFns, op.run)
 		ql.Close = op.close
 	}
@@ -468,6 +485,7 @@ type kvOp struct {
 	sfuStmt         workload.StmtHandle
 	g               keyGenerator
 	numEmptyResults *int64 // accessed atomically
+	mg              *multiRegionKeyGenerator
 }
 
 func (o *kvOp) run(ctx context.Context) (retErr error) {
@@ -509,14 +527,33 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 	if o.config.writesUseSelectForUpdate {
 		sfuArgs = make([]interface{}, o.config.batchSize)
 	}
-	for i := 0; i < o.config.batchSize; i++ {
-		j := i * argCount
-		writeArgs[j+0] = o.g.writeKey()
-		if sfuArgs != nil {
-			sfuArgs[i] = writeArgs[j]
+
+	if o.mg != nil {
+		keys := o.mg.keys()
+		mod := make([]int, len(keys))
+		for i, k := range keys {
+			mod[i] = k % len(o.config.regions)
 		}
-		writeArgs[j+1] = randomBlock(o.config, o.g.rand())
+		fmt.Println(mod)
+		for i := 0; i < o.config.batchSize; i++ {
+			j := i * argCount
+			writeArgs[j+0] = keys[i]
+			if sfuArgs != nil {
+				sfuArgs[i] = writeArgs[j]
+			}
+			writeArgs[j+1] = randomBlock(o.config, o.mg.rand())
+		}
+	} else {
+		for i := 0; i < o.config.batchSize; i++ {
+			j := i * argCount
+			writeArgs[j+0] = o.g.writeKey()
+			if sfuArgs != nil {
+				sfuArgs[i] = writeArgs[j]
+			}
+			writeArgs[j+1] = randomBlock(o.config, o.g.rand())
+		}
 	}
+
 	start := timeutil.Now()
 	var err error
 	if o.config.writesUseSelectForUpdate {
@@ -553,7 +590,7 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			return o.tryHandleWriteErr("write-commit-err", start, err)
 		}
 	} else {
-		_, err = o.writeStmt.Exec(ctx, writeArgs...)
+		// _, err = o.writeStmt.Exec(ctx, writeArgs...)
 	}
 	elapsed := timeutil.Since(start)
 	o.hists.Get(`write`).Record(elapsed)
@@ -735,6 +772,58 @@ func (g *zipfGenerator) rand() *rand.Rand {
 
 func (g *zipfGenerator) sequence() int64 {
 	return atomic.LoadInt64(&g.seq.val)
+}
+
+type multiRegionKeyGenerator struct {
+	config *kv
+	r      *rand.Rand
+	zipf   *ZipfGenerator
+}
+
+func newMultiRegionKeyGenerator(config *kv, theta float64) (*multiRegionKeyGenerator, error) {
+	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	numRegions := len(config.regions)
+	numKeysPerRegion := config.insertCount / numRegions
+	zipf, err := NewZipfGenerator(r, 0, uint64(numKeysPerRegion), theta)
+	if err != nil {
+		return nil, err
+	}
+	return &multiRegionKeyGenerator{
+		config: config,
+		r:      r,
+		zipf:   zipf,
+	}, nil
+}
+
+func (g *multiRegionKeyGenerator) rand() *rand.Rand {
+	return g.r
+}
+
+func (g *multiRegionKeyGenerator) keys() []int {
+	numKeys := g.config.batchSize
+	keys := make([]int, numKeys)
+	numRegions := len(g.config.regions)
+	localRegion := g.config.regionIdx
+	localRegionProb := g.r.Intn(100)
+	if localRegionProb < g.config.localRegionPercent {
+		x := g.zipf.Uint64(numKeys)
+		for i := 0; i < numKeys; i++ {
+			keys[i] = int(x[i])*numRegions + localRegion
+		}
+	} else {
+		remoteRegion := (g.config.regionIdx + g.r.Intn(numRegions-1) + 1) % numRegions
+		numLocalKeys := numKeys / 2
+		x := g.zipf.Uint64(numLocalKeys)
+		for i := 0; i < numLocalKeys; i++ {
+			keys[i] = int(x[i])*numRegions + localRegion
+		}
+		x = g.zipf.Uint64(numKeys - numLocalKeys)
+		for i := 0; i < numKeys-numLocalKeys; i++ {
+			keys[i+numLocalKeys] = int(x[i])*numRegions + remoteRegion
+		}
+	}
+
+	return keys
 }
 
 func randomBlock(config *kv, r *rand.Rand) []byte {
