@@ -779,7 +779,7 @@ func newMultiRegionKeyGenerator(config *kv, theta float64) (*multiRegionKeyGener
 	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	numRegions := len(config.regions)
 	numKeysPerRegion := config.insertCount / numRegions
-	zipf, err := NewZipfGenerator(r, 0, uint64(numKeysPerRegion), theta)
+	zipf, err := NewZipfGenerator(r, 0, uint64(numKeysPerRegion)-1, theta)
 	if err != nil {
 		return nil, err
 	}
