@@ -224,7 +224,9 @@ ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
 					}
 
 					for _, region := range w.regions {
-						_, err = db.Exec(fmt.Sprintf(`ALTER PARTITION "%s" OF INDEX kv.public.kv@primary CONFIGURE ZONE USING num_voters=1`, region))
+						_, err = db.Exec(fmt.Sprintf(`
+						SET override_multi_region_zone_config=true;
+						ALTER PARTITION "%s" OF INDEX kv.public.kv@primary CONFIGURE ZONE USING num_voters=1`, region))
 						if err != nil {
 							return err
 						}

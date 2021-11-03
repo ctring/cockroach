@@ -116,10 +116,6 @@ func (l InsertsDataLoader) InitialDataLoad(
 
 				lastTime := timeutil.Now()
 				for batchIdx := startIdx; batchIdx < endIdx; batchIdx++ {
-					if id == 0 && timeutil.Since(lastTime).Seconds() >= 1 {
-						log.Infof(ctx, `imported %s (%d rows)`, table.Name, int(atomic.LoadInt64(&tableRowsAtomic)))
-						lastTime = timeutil.Now()
-					}
 					for _, row := range table.InitialRows.BatchRows(batchIdx) {
 						atomic.AddInt64(&tableRowsAtomic, 1)
 						if len(params) != 0 {
@@ -140,6 +136,10 @@ func (l InsertsDataLoader) InitialDataLoad(
 								return err
 							}
 						}
+					}
+					if id == 0 && timeutil.Since(lastTime).Seconds() >= 1 {
+						log.Infof(ctx, `imported %s (%d rows)`, table.Name, int(atomic.LoadInt64(&tableRowsAtomic)))
+						lastTime = timeutil.Now()
 					}
 				}
 				return flush()
