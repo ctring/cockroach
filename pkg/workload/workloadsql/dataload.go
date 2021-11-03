@@ -43,7 +43,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 	}
 
 	if l.BatchSize <= 0 {
-		l.BatchSize = 1000
+		l.BatchSize = 10000
 	}
 	if l.Concurrency < 1 {
 		l.Concurrency = 1
@@ -94,6 +94,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 				// Account for any rounding error in batchesPerWorker.
 				endIdx = table.InitialRows.NumBatches
 			}
+			id := i
 			g.Go(func() error {
 				var insertStmtBuf bytes.Buffer
 				var params []interface{}
@@ -113,7 +114,12 @@ func (l InsertsDataLoader) InitialDataLoad(
 				}
 				_ = flush()
 
+				lastTime := timeutil.Now()
 				for batchIdx := startIdx; batchIdx < endIdx; batchIdx++ {
+					if id == 0 && timeutil.Since(lastTime).Seconds() >= 1 {
+						log.Infof(ctx, `imported %s (%d rows)`, table.Name, int(atomic.LoadInt64(&tableRowsAtomic)))
+						lastTime = timeutil.Now()
+					}
 					for _, row := range table.InitialRows.BatchRows(batchIdx) {
 						atomic.AddInt64(&tableRowsAtomic, 1)
 						if len(params) != 0 {
