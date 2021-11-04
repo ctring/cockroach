@@ -173,18 +173,9 @@ func (w *kv) Flags() workload.Flags { return w.flags }
 // Hooks implements the Hookser interface.
 func (w *kv) Hooks() workload.Hooks {
 	return workload.Hooks{
-		PostLoad: func(db *gosql.DB) error {
+		PreLoad: func(db *gosql.DB) error {
 			var err error
-			if w.enum {
-				_, err = db.Exec(`
-CREATE TYPE enum_type AS ENUM ('v');
-ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
-				if err != nil {
-					return err
-				}
-			}
 			if len(w.regions) > 0 {
-
 				for r, region := range w.regions {
 					if r == 0 {
 						_, err = db.Exec(fmt.Sprintf(`ALTER DATABASE kv PRIMARY REGION "%s"`, region))
@@ -233,7 +224,18 @@ ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
 					}
 				}
 			}
-
+			return err
+		},
+		PostLoad: func(db *gosql.DB) error {
+			var err error
+			if w.enum {
+				_, err = db.Exec(`
+CREATE TYPE enum_type AS ENUM ('v');
+ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
+				if err != nil {
+					return err
+				}
+			}
 			return err
 		},
 		Validate: func() error {
