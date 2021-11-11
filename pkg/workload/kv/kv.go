@@ -91,6 +91,8 @@ type kv struct {
 	regionIdx                            int
 	localRegionPercent                   int
 	theta                                float64
+	statements                           int
+	update                               bool
 }
 
 func init() {
@@ -159,6 +161,8 @@ var kvMeta = workload.Meta{
 		g.flags.IntVar(&g.regionIdx, `region-idx`, 0, `Region of this client`)
 		g.flags.IntVar(&g.localRegionPercent, `local-region-percent`, 100, `Percent of transactions that only access local data`)
 		g.flags.Float64Var(&g.theta, `theta`, 0.5, `Theta parameter of the Zipfian distribution in multi-region setup`)
+		g.flags.IntVar(&g.statements, `statements`, 1, `Number of statements. If larger than 1, they are wrapped in a transaction`)
+		g.flags.BoolVar(&g.update, `update`, false, `Use update statements`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -414,6 +418,17 @@ func (w *kv) Ops(
 	}
 	writeStmtStr := buf.String()
 
+	buf.Reset()
+	buf.WriteString(`UPDATE kv SET v = $1 WHERE k IN (`)
+	for i := 0; i < w.batchSize; i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		fmt.Fprintf(&buf, `$%d`, i+2)
+	}
+	buf.WriteString(`)`)
+	updateStmtStr := buf.String()
+
 	// Select for update statement
 	var sfuStmtStr string
 	if w.writesUseSelectForUpdate {
@@ -452,6 +467,7 @@ func (w *kv) Ops(
 		}
 		op.readStmt = op.sr.Define(readStmtStr)
 		op.writeStmt = op.sr.Define(writeStmtStr)
+		op.updateStmt = op.sr.Define(updateStmtStr)
 		if len(sfuStmtStr) > 0 {
 			op.sfuStmt = op.sr.Define(sfuStmtStr)
 		}
@@ -489,6 +505,7 @@ type kvOp struct {
 	writeStmt       workload.StmtHandle
 	spanStmt        workload.StmtHandle
 	sfuStmt         workload.StmtHandle
+	updateStmt      workload.StmtHandle
 	g               keyGenerator
 	numEmptyResults *int64 // accessed atomically
 	mg              *multiRegionKeyGenerator
@@ -527,6 +544,56 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 		o.hists.Get(`span`).Record(elapsed)
 		return err
 	}
+
+	start := timeutil.Now()
+	if o.config.update {
+		updateArgs := make([]interface{}, (1+o.config.batchSize)*o.config.statements)
+		var keys []int
+		if o.mg != nil {
+			keys = o.mg.keys(o.config.statements * o.config.batchSize)
+		}
+		for s := 0; s < o.config.statements; s++ {
+			offset := s * (1 + o.config.batchSize)
+			updateArgs[offset] = randomBlock(o.config, o.mg.rand())
+			for i := 0; i < o.config.batchSize; i++ {
+				j := offset + i + 1
+				if o.mg != nil {
+					updateArgs[j] = keys[s*o.config.batchSize+i]
+				} else {
+					updateArgs[j] = o.g.writeKey()
+				}
+			}
+		}
+
+		var tx pgx.Tx
+		var err error
+		if tx, err = o.mcp.Get().Begin(ctx); err != nil {
+			return err
+		}
+		defer func() {
+			rollbackErr := tx.Rollback(ctx)
+			if !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+				retErr = errors.CombineErrors(retErr, rollbackErr)
+			}
+		}()
+
+		for s := 0; s < o.config.statements; s++ {
+			from := s * (1 + o.config.batchSize)
+			to := from + (1 + o.config.batchSize)
+			if _, err = o.updateStmt.ExecTx(ctx, tx, updateArgs[from:to]...); err != nil {
+				// Multiple write transactions can contend and encounter
+				// a serialization failure. We swallow such an error.
+				return o.tryHandleWriteErr("write-write-err", start, err)
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return o.tryHandleWriteErr("write-commit-err", start, err)
+		}
+		elapsed := timeutil.Since(start)
+		o.hists.Get(`write`).Record(elapsed)
+		return err
+	}
+
 	const argCount = 2
 	writeArgs := make([]interface{}, argCount*o.config.batchSize)
 	var sfuArgs []interface{}
@@ -535,7 +602,7 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 	}
 
 	if o.mg != nil {
-		keys := o.mg.keys()
+		keys := o.mg.keys(o.config.batchSize)
 		for i := 0; i < o.config.batchSize; i++ {
 			j := i * argCount
 			writeArgs[j+0] = keys[i]
@@ -555,7 +622,6 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 		}
 	}
 
-	start := timeutil.Now()
 	var err error
 	if o.config.writesUseSelectForUpdate {
 		// We could use crdb.ExecuteTx, but we avoid retries in this workload so
@@ -800,8 +866,7 @@ func (g *multiRegionKeyGenerator) rand() *rand.Rand {
 	return g.r
 }
 
-func (g *multiRegionKeyGenerator) keys() []int {
-	numKeys := g.config.batchSize
+func (g *multiRegionKeyGenerator) keys(numKeys int) []int {
 	numRegions := len(g.config.regions)
 	localRegion := g.config.regionIdx
 	localRegionProb := g.r.Intn(100)
@@ -829,6 +894,9 @@ func (g *multiRegionKeyGenerator) keys() []int {
 }
 
 func keyBatch(z *ZipfGenerator, r *rand.Rand, n int) []int {
+	if n == 0 {
+		return []int{}
+	}
 	keyMap := make(map[int]struct{})
 	keys := make([]int, n)
 	iMax := int(z.IMax())
