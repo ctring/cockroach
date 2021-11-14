@@ -90,7 +90,7 @@ type kv struct {
 	singleReplica                        bool
 	regionIdx                            int
 	localRegionPercent                   int
-	theta                                float64
+	hot                                  int
 	statements                           int
 	update                               bool
 }
@@ -160,7 +160,7 @@ var kvMeta = workload.Meta{
 		g.flags.BoolVar(&g.singleReplica, `single-replica`, false, `Only have a single replica per region`)
 		g.flags.IntVar(&g.regionIdx, `region-idx`, 0, `Region of this client`)
 		g.flags.IntVar(&g.localRegionPercent, `local-region-percent`, 100, `Percent of transactions that only access local data`)
-		g.flags.Float64Var(&g.theta, `theta`, 0.5, `Theta parameter of the Zipfian distribution in multi-region setup`)
+		g.flags.IntVar(&g.hot, `hot`, 100, `Number of hot keys per region`)
 		g.flags.IntVar(&g.statements, `statements`, 1, `Number of statements. If larger than 1, they are wrapped in a transaction`)
 		g.flags.BoolVar(&g.update, `update`, false, `Use update statements`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
@@ -485,10 +485,7 @@ func (w *kv) Ops(
 		}
 		op.mg = nil
 		if len(w.regions) > 1 {
-			op.mg, err = newMultiRegionKeyGenerator(w, w.theta)
-			if err != nil {
-				return workload.QueryLoad{}, err
-			}
+			op.mg = newMultiRegionKeyGenerator(w)
 		}
 		ql.WorkerFns = append(ql.WorkerFns, op.run)
 		ql.Close = op.close
@@ -547,11 +544,18 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 
 	start := timeutil.Now()
 	if o.config.update {
+		var err error
 		updateArgs := make([]interface{}, (1+o.config.batchSize)*o.config.statements)
 		var keys []int
-		if o.mg != nil {
-			keys = o.mg.keys(o.config.statements * o.config.batchSize)
+		if o.mg == nil {
+			panic("Multi-region key generator must be set")
 		}
+
+		keys, err = o.mg.keys(o.config.statements * o.config.batchSize)
+		if err != nil {
+			return err
+		}
+
 		for s := 0; s < o.config.statements; s++ {
 			offset := s * (1 + o.config.batchSize)
 			updateArgs[offset] = randomBlock(o.config, o.mg.rand())
@@ -566,7 +570,6 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 		}
 
 		var tx pgx.Tx
-		var err error
 		if tx, err = o.mcp.Get().Begin(ctx); err != nil {
 			return err
 		}
@@ -602,7 +605,10 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 	}
 
 	if o.mg != nil {
-		keys := o.mg.keys(o.config.batchSize)
+		keys, err := o.mg.keys(o.config.batchSize)
+		if err != nil {
+			return err
+		}
 		for i := 0; i < o.config.batchSize; i++ {
 			j := i * argCount
 			writeArgs[j+0] = keys[i]
@@ -844,67 +850,78 @@ func (g *zipfGenerator) sequence() int64 {
 type multiRegionKeyGenerator struct {
 	config *kv
 	r      *rand.Rand
-	zipf   *ZipfGenerator
 }
 
-func newMultiRegionKeyGenerator(config *kv, theta float64) (*multiRegionKeyGenerator, error) {
+func newMultiRegionKeyGenerator(config *kv) *multiRegionKeyGenerator {
 	r := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-	numRegions := len(config.regions)
-	numKeysPerRegion := config.insertCount / numRegions
-	zipf, err := NewZipfGenerator(r, 0, uint64(numKeysPerRegion)-1, theta)
-	if err != nil {
-		return nil, err
-	}
 	return &multiRegionKeyGenerator{
 		config: config,
 		r:      r,
-		zipf:   zipf,
-	}, nil
+	}
 }
 
 func (g *multiRegionKeyGenerator) rand() *rand.Rand {
 	return g.r
 }
 
-func (g *multiRegionKeyGenerator) keys(numKeys int) []int {
+func (g *multiRegionKeyGenerator) keys(numKeys int) ([]int, error) {
 	numRegions := len(g.config.regions)
 	localRegion := g.config.regionIdx
 	localRegionProb := g.r.Intn(100)
 
 	var keys []int
+	var err error
 	if localRegionProb < g.config.localRegionPercent {
-		keys = keyBatch(g.zipf, g.r, numKeys)
+		keys, err = g.keyBatch(numKeys, 2)
+		if err != nil {
+			return []int{}, err
+		}
 		for i := 0; i < len(keys); i++ {
 			keys[i] = keys[i]*numRegions + localRegion
 		}
 	} else {
 		remoteRegion := (g.config.regionIdx + g.r.Intn(numRegions-1) + 1) % numRegions
 		numLocalKeys := numKeys / 2
-		keys = keyBatch(g.zipf, g.r, numLocalKeys)
+		keys, err = g.keyBatch(numLocalKeys, 1)
+		if err != nil {
+			return []int{}, err
+		}
 		for i := 0; i < len(keys); i++ {
 			keys[i] = keys[i]*numRegions + localRegion
 		}
-		remoteKeys := keyBatch(g.zipf, g.r, numKeys-numLocalKeys)
+
+		remoteKeys, err := g.keyBatch(numKeys-numLocalKeys, 1)
+		if err != nil {
+			return []int{}, err
+		}
 		for i := 0; i < len(remoteKeys); i++ {
 			keys = append(keys, remoteKeys[i]*numRegions+remoteRegion)
 		}
 	}
 
-	return keys
+	return keys, nil
 }
 
-func keyBatch(z *ZipfGenerator, r *rand.Rand, n int) []int {
-	if n == 0 {
-		return []int{}
+func (g *multiRegionKeyGenerator) keyBatch(n int, numFromHot int) ([]int, error) {
+	if n < 1 {
+		return []int{}, errors.New("Number of keys must be at least 1")
 	}
-	keyMap := make(map[int]struct{})
+
+	numRegions := len(g.config.regions)
+	numKeysPerRegion := g.config.insertCount / numRegions
+	hot := g.config.hot
+
+	if numKeysPerRegion < hot {
+		return []int{}, errors.New("Number of keys per region must be larger than or equal to HOT")
+	}
+
 	keys := make([]int, n)
-	iMax := int(z.IMax())
-	keys[0] = int(z.Uint64())
-	keyMap[keys[0]] = struct{}{}
-	for i := 1; i < n; i++ {
+	keyMap := make(map[int]struct{})
+	i := 0
+
+	for ; i < numFromHot; i++ {
 		for {
-			keys[i] = r.Intn(iMax + 1)
+			keys[i] = g.r.Intn(hot)
 			_, exists := keyMap[keys[i]]
 			if !exists {
 				break
@@ -912,7 +929,19 @@ func keyBatch(z *ZipfGenerator, r *rand.Rand, n int) []int {
 		}
 		keyMap[keys[i]] = struct{}{}
 	}
-	return keys
+
+	for ; i < n; i++ {
+		for {
+			keys[i] = g.r.Intn(numKeysPerRegion-hot) + hot
+			_, exists := keyMap[keys[i]]
+			if !exists {
+				break
+			}
+		}
+		keyMap[keys[i]] = struct{}{}
+	}
+
+	return keys, nil
 }
 
 func randomBlock(config *kv, r *rand.Rand) []byte {
