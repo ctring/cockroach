@@ -547,18 +547,16 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 		var err error
 		updateArgs := make([]interface{}, (1+o.config.batchSize)*o.config.statements)
 		var keys []int
-		if o.mg == nil {
-			panic("Multi-region key generator must be set")
-		}
-
-		keys, err = o.mg.keys(o.config.statements * o.config.batchSize)
-		if err != nil {
-			return err
+		if o.mg != nil {
+			keys, err = o.mg.keys(o.config.statements * o.config.batchSize)
+			if err != nil {
+				return err
+			}
 		}
 
 		for s := 0; s < o.config.statements; s++ {
 			offset := s * (1 + o.config.batchSize)
-			updateArgs[offset] = randomBlock(o.config, o.mg.rand())
+			updateArgs[offset] = randomBlock(o.config, o.g.rand())
 			for i := 0; i < o.config.batchSize; i++ {
 				j := offset + i + 1
 				if o.mg != nil {
@@ -569,27 +567,17 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			}
 		}
 
-		var tx pgx.Tx
-		if tx, err = o.mcp.Get().Begin(ctx); err != nil {
-			return err
-		}
-		defer func() {
-			rollbackErr := tx.Rollback(ctx)
-			if !errors.Is(rollbackErr, pgx.ErrTxClosed) {
-				retErr = errors.CombineErrors(retErr, rollbackErr)
-			}
-		}()
-
+		batch := &pgx.Batch{}
+		batch.Queue("BEGIN")
 		for s := 0; s < o.config.statements; s++ {
 			from := s * (1 + o.config.batchSize)
 			to := from + (1 + o.config.batchSize)
-			if _, err = o.updateStmt.ExecTx(ctx, tx, updateArgs[from:to]...); err != nil {
-				// Multiple write transactions can contend and encounter
-				// a serialization failure. We swallow such an error.
-				return o.tryHandleWriteErr("write-write-err", start, err)
-			}
+			batch.Queue(o.updateStmt.PreparedName(), updateArgs[from:to]...)
 		}
-		if err = tx.Commit(ctx); err != nil {
+		batch.Queue("COMMIT")
+
+		batchResults := o.mcp.Get().SendBatch(ctx, batch)
+		if err := batchResults.Close(); err != nil {
 			return o.tryHandleWriteErr("write-commit-err", start, err)
 		}
 		elapsed := timeutil.Since(start)
@@ -615,7 +603,7 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			if sfuArgs != nil {
 				sfuArgs[i] = writeArgs[j]
 			}
-			writeArgs[j+1] = randomBlock(o.config, o.mg.rand())
+			writeArgs[j+1] = randomBlock(o.config, o.g.rand())
 		}
 	} else {
 		for i := 0; i < o.config.batchSize; i++ {
@@ -858,10 +846,6 @@ func newMultiRegionKeyGenerator(config *kv) *multiRegionKeyGenerator {
 		config: config,
 		r:      r,
 	}
-}
-
-func (g *multiRegionKeyGenerator) rand() *rand.Rand {
-	return g.r
 }
 
 func (g *multiRegionKeyGenerator) keys(numKeys int) ([]int, error) {

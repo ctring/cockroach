@@ -146,6 +146,10 @@ type StmtHandle struct {
 	s *stmt
 }
 
+func (h StmtHandle) PreparedName() string {
+	return h.s.preparedName
+}
+
 // Exec executes a query that doesn't return rows. The query is executed on the
 // connection that was passed to SQLRunner.Init.
 //
