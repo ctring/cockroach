@@ -19,6 +19,8 @@ import (
 	"hash"
 	"math"
 	"math/rand"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -93,6 +95,7 @@ type kv struct {
 	hot                                  int
 	statements                           int
 	update                               bool
+	sortKeys                             bool
 }
 
 func init() {
@@ -163,6 +166,7 @@ var kvMeta = workload.Meta{
 		g.flags.IntVar(&g.hot, `hot`, 100, `Number of hot keys per region`)
 		g.flags.IntVar(&g.statements, `statements`, 1, `Number of statements. If larger than 1, they are wrapped in a transaction`)
 		g.flags.BoolVar(&g.update, `update`, false, `Use update statements`)
+		g.flags.BoolVar(&g.sortKeys, `sort-keys`, false, `Sort the keys in a transaction`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -201,7 +205,9 @@ func (w *kv) Hooks() workload.Hooks {
 					return err
 				}
 
+				// Set sql.defaults.results_buffer.size = 0 to disable auto-retry for batch request
 				_, err = db.Exec(`
+				SET CLUSTER SETTING sql.defaults.results_buffer.size = "0";
 				ALTER TABLE kv ALTER COLUMN region SET NOT NULL;
 				ALTER TABLE kv SET LOCALITY REGIONAL BY ROW AS "region";`)
 				if err != nil {
@@ -508,6 +514,13 @@ type kvOp struct {
 	mg              *multiRegionKeyGenerator
 }
 
+var reAbortReasons = []*regexp.Regexp{
+	regexp.MustCompile(`ABORT_[A-Z_]+`),
+	regexp.MustCompile(`RETRY_[A-Z]_+`),
+	regexp.MustCompile(`ReadWithinUncertaintyInterval`),
+	regexp.MustCompile(`WriteTooOldError`),
+}
+
 func (o *kvOp) run(ctx context.Context) (retErr error) {
 	statementProbability := o.g.rand().Intn(100) // Determines what statement is executed.
 	if statementProbability < o.config.readPercent {
@@ -554,6 +567,10 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			}
 		}
 
+		if o.config.sortKeys {
+			sort.Ints(keys)
+		}
+
 		for s := 0; s < o.config.statements; s++ {
 			offset := s * (1 + o.config.batchSize)
 			updateArgs[offset] = randomBlock(o.config, o.g.rand())
@@ -569,6 +586,8 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 
 		batch := &pgx.Batch{}
 		batch.Queue("BEGIN")
+		// Produce some out put so that the batch request won't be automatically retried
+		batch.Queue("SELECT 1")
 		for s := 0; s < o.config.statements; s++ {
 			from := s * (1 + o.config.batchSize)
 			to := from + (1 + o.config.batchSize)
@@ -578,7 +597,18 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 
 		batchResults := o.mcp.Get().SendBatch(ctx, batch)
 		if err := batchResults.Close(); err != nil {
-			return o.tryHandleWriteErr("write-commit-err", start, err)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				if pgcode.MakeCode(pgErr.Code) == pgcode.SerializationFailure {
+					for _, re := range reAbortReasons {
+						reason := re.Find([]byte(pgErr.Message))
+						if reason != nil {
+							return o.tryHandleWriteErr(re.String(), start, err)
+						}
+					}
+				}
+			}
+			return o.tryHandleWriteErr("commit-err", start, err)
 		}
 		elapsed := timeutil.Since(start)
 		o.hists.Get(`write`).Record(elapsed)
